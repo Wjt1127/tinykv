@@ -106,11 +106,12 @@ func NewStandAloneStorageReader(txn *badger.Txn) *StandAloneStorageReader {
 
 // 调用 kv/util/engine_util/util.go:GetCFFromTxn ,其本质就是调用的 badger 中的txn.Get
 func (sreader *StandAloneStorageReader) GetCF(cf string, key []byte) ([]byte, error) {
-	var (
-		val []byte
-		err error
-	)
-	val, err = engine_util.GetCFFromTxn(sreader.ReadTxn, cf, key)
+	val, err := engine_util.GetCFFromTxn(sreader.ReadTxn, cf, key)
+	// 上层测试认为 GetCFFromTxn 返回的 KeyNotFound 不算 err，需要额外的处理
+	if err == badger.ErrKeyNotFound {
+		return nil, nil
+	}
+
 	return val, err
 }
 
