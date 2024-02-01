@@ -46,27 +46,34 @@ var ErrSnapshotTemporarilyUnavailable = errors.New("snapshot is temporarily unav
 // application is responsible for cleanup and recovery in this case.
 type Storage interface {
 	// InitialState returns the saved HardState and ConfState information.
+	// HardState: 包含 Raft 节点的当前状态，例如当前的任期和已投票的节点等信息
+	// ConfState: 包含集群的配置信息，例如集群中的节点列表
 	InitialState() (pb.HardState, pb.ConfState, error)
 	// Entries returns a slice of log entries in the range [lo,hi).
 	// MaxSize limits the total size of the log entries returned, but
 	// Entries returns at least one entry if any.
+	// 返回在索引范围 [lo, hi) 内的一系列日志条目
 	Entries(lo, hi uint64) ([]pb.Entry, error)
 	// Term returns the term of entry i, which must be in the range
 	// [FirstIndex()-1, LastIndex()]. The term of the entry before
 	// FirstIndex is retained for matching purposes even though the
 	// rest of that entry may not be available.
+	// 返回索引 i 处的日志条目的任期（term）
 	Term(i uint64) (uint64, error)
 	// LastIndex returns the index of the last entry in the log.
+	// 返回日志中最后一个条目的索引
 	LastIndex() (uint64, error)
 	// FirstIndex returns the index of the first log entry that is
 	// possibly available via Entries (older entries have been incorporated
 	// into the latest Snapshot; if storage only contains the dummy entry the
 	// first log entry is not available).
+	// 返回可能通过 Entries 方法检索的日志中第一个条目的索引, 如果存储仅包含虚拟条目，则第一个日志条目可能不可用。
 	FirstIndex() (uint64, error)
 	// Snapshot returns the most recent snapshot.
 	// If snapshot is temporarily unavailable, it should return ErrSnapshotTemporarilyUnavailable,
 	// so raft state machine could know that Storage needs some time to prepare
 	// snapshot and call Snapshot later.
+	// 返回最近的快照（snapshot）
 	Snapshot() (pb.Snapshot, error)
 }
 
@@ -191,6 +198,7 @@ func (ms *MemoryStorage) ApplySnapshot(snap pb.Snapshot) error {
 // can be used to reconstruct the state at that point.
 // If any configuration changes have been made since the last compaction,
 // the result of the last ApplyConfChange must be passed in.
+// 将当前entries里面 index <= i 的 Log 创建为snapshot
 func (ms *MemoryStorage) CreateSnapshot(i uint64, cs *pb.ConfState, data []byte) (pb.Snapshot, error) {
 	ms.Lock()
 	defer ms.Unlock()
@@ -215,6 +223,7 @@ func (ms *MemoryStorage) CreateSnapshot(i uint64, cs *pb.ConfState, data []byte)
 // Compact discards all log entries prior to compactIndex.
 // It is the application's responsibility to not attempt to compact an index
 // greater than raftLog.applied.
+// 认为上层不要compact 没有被 applied 的log
 func (ms *MemoryStorage) Compact(compactIndex uint64) error {
 	ms.Lock()
 	defer ms.Unlock()
@@ -227,7 +236,7 @@ func (ms *MemoryStorage) Compact(compactIndex uint64) error {
 	}
 
 	i := compactIndex - offset
-	ents := make([]pb.Entry, 1, 1+uint64(len(ms.ents))-i)
+	ents := make([]pb.Entry, 1, 1+uint64(len(ms.ents))-i) // 第三个参数是预先分配这么大的数组大小
 	ents[0].Index = ms.ents[i].Index
 	ents[0].Term = ms.ents[i].Term
 	ents = append(ents, ms.ents[i+1:]...)
