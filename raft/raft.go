@@ -197,7 +197,7 @@ func newRaft(c *Config) *Raft {
 		Prs:                       map[uint64]*Progress{},
 		State:                     StateFollower,     // 初始化的时候全部设置为 follower
 		votes:                     map[uint64]bool{}, // 初始化无人开始投票
-		msgs:                      []pb.Message{},    // 初始化时没有消息需要发送
+		msgs:                      nil,               // 初始化时没有消息需要发送(测试需要是nil而不是空msgs)
 		Lead:                      0,                 // 初始化时 Leader ID 设置为 0
 		heartbeatTimeout:          c.HeartbeatTick,
 		electionTimeout:           c.ElectionTick,
@@ -310,6 +310,7 @@ func (r *Raft) becomeLeader() {
 	r.State = StateLeader
 	r.Lead = r.id
 	r.heartbeatElapsed = 0
+
 	// 因为leadership 转变了，所以需要重置 nextIndex 和 matchIndex
 	for i := range r.Prs {
 		r.Prs[i].Next = r.RaftLog.LastIndex() + 1 // 初始化为 Leader 的最后一条LogIndex，如果冲突了不匹配后续递减修改
@@ -322,7 +323,7 @@ func (r *Raft) becomeLeader() {
 	// 这里的 HeartBeat 不追加日志，以此减少没有上层应用请求时的无用空数据写入（对比原文的 AppendEntry 中放空数据），但是
 	//		对于原文的使用追加日志实现的HeartBeat可以频繁的同步多个节点的日志提交状态
 	// 这里的 propose 代替了一次原文的 Append 空 entry，以此实现触发其他节点状态机推动
-	r.Step(pb.Message{MsgType: pb.MessageType_MsgPropose, From: r.id, To: r.id, Term: r.Term, Entries: make([]*pb.Entry, 0)}) // 我觉得也可以 append 到r.msg中
+	r.Step(pb.Message{MsgType: pb.MessageType_MsgPropose, From: r.id, To: r.id, Term: r.Term, Entries: []*pb.Entry{{}}})
 }
 
 /* *************************** Step : Msg Handle *************************** */
@@ -454,8 +455,22 @@ func (r *Raft) bcastHeartBeat() {
 // 先追加日志到本地，然后do_replicate，即发送 MsgAppendEntry 消息
 func (r *Raft) handlePropose(m pb.Message) {
 	// 先追加日志
-	r.prepareForAppendEntries(m.Entries)
+	// 为追加日志做处理，需要把 propose 消息中的 Entry 的 Term、Index 信息进行填充
+	// 上层发送的 propose 信息中只包含数据，因为上层不知道当前集群内部的 Term 和这条日志具体的Index
+	lastIndex := r.RaftLog.LastIndex()
+	for i := range m.Entries {
+		m.Entries[i].Index = lastIndex + uint64(i) + 1
+		m.Entries[i].Term = r.Term
+		// 如果是配置修改信息
+		if m.Entries[i].EntryType == pb.EntryType_EntryConfChange {
+			r.PendingConfIndex = m.Entries[i].Index
+		}
+	}
 	r.RaftLog.appendEntries(m.Entries)
+
+	// append之后自己的Next需要调整，测试测到了
+	r.Prs[r.id].Match = r.RaftLog.LastIndex() // 自己和自己的匹配
+	r.Prs[r.id].Next = r.RaftLog.LastIndex() + 1
 
 	// 然后进行日志复制，发送 MsgAppendEntry
 	if len(r.Prs) == 1 { // 如果集群只有一个节点，那么直接提交
@@ -465,28 +480,9 @@ func (r *Raft) handlePropose(m pb.Message) {
 	}
 }
 
-// 为追加日志做处理，需要把 propose 消息中的 Entry 的 Term、Index 信息进行填充
-// 上层发送的 propose 信息中只包含数据，因为上层不知道当前集群内部的 Term 和这条日志具体的Index
-func (r *Raft) prepareForAppendEntries(entries []*pb.Entry) {
-	lastIndex := r.RaftLog.LastIndex()
-	for i := range entries {
-		entries[i].Index = lastIndex + uint64(i) + 1
-		entries[i].Term = r.Term
-		// 如果是配置修改信息
-		if entries[i].EntryType == pb.EntryType_EntryConfChange {
-			r.PendingConfIndex = entries[i].Index
-		}
-	}
-}
-
 // Leader 广播 AppendEntry，根据 Leader 中记录的 Prs，对每个节点发送[nextIndex, lastIndex]之间的日志
 func (r *Raft) bcastAppendEntry() {
-	_, confState, err := r.RaftLog.storage.InitialState()
-	if err != nil {
-		panic(err)
-	}
-	peers := confState.Nodes
-	for _, to := range peers {
+	for to := range r.Prs {
 		if to == r.id {
 			continue
 		}
@@ -519,7 +515,7 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 	// m.Term 是lastLogTerm
 	// 如果接收者上一轮投票投的就是这个candidate，那么说明上一轮就认可了这个candidate，可以继续投
 	if ((m.Term > r.Term || m.Term == r.Term) && (r.Vote == None || r.Vote == m.From)) && // 接收者是否可以投票条件
-		r.RaftLog.isUpToDateAsMe(m.Term, m.Index) { // candidate 是否具有 up-to-date 的Log序列
+		r.RaftLog.isUpToDateAsMe(m.LogTerm, m.Index) { // candidate 是否具有 up-to-date 的Log序列
 		// 选择投票
 		r.becomeFollower(m.Term, None) // 不管怎么样，这里已经判断了，candidate 的日志序列更新
 		voteResponseMsg.Reject = false
@@ -629,8 +625,8 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 
 				if idx-newLogStartIndex != uint64(len(m.Entries)) { // 说明是有需要截断的日志，而不是全能匹配
 					r.RaftLog.truncate(idx)
-					r.RaftLog.stabled = min(r.RaftLog.applied, idx-1)         // idx - 1后面的截断了
 					r.RaftLog.appendEntries(m.Entries[idx-newLogStartIndex:]) // 追加日志
+					r.RaftLog.stabled = min(r.RaftLog.stabled, idx-1)         // idx - 1后面的截断了
 				}
 			}
 
@@ -640,14 +636,14 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 				r.RaftLog.committed = min(m.Commit, m.Index+uint64(len(m.Entries)))
 			}
 			appendEntryResponseMsg.Reject = false                           // 同意
-			appendEntryResponseMsg.Index = m.Index + uint64(len(m.Entries)) // 同步nextIndex
+			appendEntryResponseMsg.Index = m.Index + uint64(len(m.Entries)) // 返回的是MatchIndex
 			appendEntryResponseMsg.LogTerm, _ = r.RaftLog.Term(appendEntryResponseMsg.Index)
-		} else { // 冲突了，返回这个任期的第一条日志的Index
+		} else { // 冲突了，返回这个任期前的最后一条日志的Index
 			appendEntryResponseMsg.Reject = true
 			conflictTerm := logTermOfR
 			for _, entry := range r.RaftLog.entries {
 				if entry.Term == conflictTerm {
-					appendEntryResponseMsg.Index = entry.Index - 1 // 冲突任期前的第一个条目
+					appendEntryResponseMsg.Index = entry.Index - 1 // 这个任期前的最后一条日志的Index
 					break
 				}
 			}
@@ -669,14 +665,14 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 	}
 
 	// replicate 成功，看一下能不能 commit （只有当前任期的leader才能commit，并以此间接commit前面未提交的日志）
-	if r.appendResponseHelperMaybeUpdate(m.From, m.Index) { // 说明这条回复可能造成 commitIndex 的更新
-		if r.appendResponseHelperMaybeCommit() { // 修改了 commitIndex
+	if r.appendResponseHelperMaybeUpdate(m.From, m.Index) { // 判断是否能更新Match和NextIndex，进而判断是否能造成 commitIndex 的更新
+		if r.appendResponseHelperMaybeCommit() { // 判断是否可以修改 commitIndex，只有本任期内的commitIndex才能提交
 			r.bcastAppendEntry()
 		}
 	}
 }
 
-// handleAppendEntriesResponse 中调用的，用于确定接收到的回复是否是过期回复（可能由于网络延迟等原因），进而确认是否可能造成 commitIndex 的更新
+// handleAppendEntriesResponse 中调用的，用于确定接收到的回复是否可以更新Match和NextIndex，进而确认是否可能造成 commitIndex 的更新
 func (r *Raft) appendResponseHelperMaybeUpdate(from, index uint64) bool {
 	update := false // 不用跟新，表明是过期的消息回复
 	if r.Prs[from].Match < index {
@@ -694,10 +690,11 @@ func (r *Raft) appendResponseHelperMaybeCommit() bool {
 		matchSlice = append(matchSlice, progress.Match)
 	}
 	// 排序获得所有节点的 matchIndex 中位数，中位数就是被大多数节点复制的日志索引
-	sort.Sort(matchSlice)
-	mid := len(matchSlice)/2 + 1
+	sort.Sort(sort.Reverse(matchSlice))
+	mid := len(matchSlice) / 2
 	readyCommitIndex := matchSlice[mid]
 
+	// 判断这个commitIndex是否是本任期内的消息
 	return r.RaftLog.maybeCommit(readyCommitIndex, r.Term)
 }
 
@@ -792,22 +789,21 @@ func (r *Raft) sendAppend(to uint64) bool {
 	prevLogTerm, err := r.RaftLog.Term(uint64(prevLogIndex))
 
 	if err == nil { // 这条 Index 在 Leader 的Log entries中，不是无效index，也不是在snapshot中
-		entries := r.RaftLog.entries[prevLogIndex+1:]
+		entries := r.RaftLog.getEntries(prevLogIndex+1, 0)
 		appendEntries := make([]*pb.Entry, 0)
 		for i := range entries {
 			appendEntries = append(appendEntries, &entries[i])
 		}
 
 		sendMsg := pb.Message{
-			MsgType:  pb.MessageType_MsgAppend,
-			To:       to,
-			From:     r.id,
-			Term:     r.Term,
-			LogTerm:  prevLogTerm, // 需要和follower对齐的依据
-			Index:    uint64(prevLogIndex),
-			Entries:  appendEntries,
-			Commit:   r.RaftLog.committed,
-			Snapshot: nil, // 如果发送的不是snapshot 设置为 nil
+			MsgType: pb.MessageType_MsgAppend,
+			To:      to,
+			From:    r.id,
+			Term:    r.Term,
+			LogTerm: prevLogTerm, // 需要和follower对齐的依据
+			Index:   prevLogIndex,
+			Entries: appendEntries,
+			Commit:  r.RaftLog.committed,
 			// Leader 不用设置 reject 位
 		}
 		r.msgs = append(r.msgs, sendMsg) // 异步塞进 msgs 里面，等待后续 Step 的处理

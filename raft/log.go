@@ -124,10 +124,10 @@ func (l *RaftLog) allEntries() []pb.Entry {
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	if len(l.entries) > 0 {
-		return l.entries[l.stabled-l.dummyIndex+1:]
+	if l.LastIndex()-l.stabled == 0 {
+		return make([]pb.Entry, 0)
 	}
-	return nil
+	return l.getEntries(l.stabled+1, 0)
 }
 
 // nextEnts returns all the committed but not applied entries
@@ -168,7 +168,7 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
 	if i > l.LastIndex() { // 无效index
 		panic("out of range in Term()")
-	} else if i > l.dummyIndex { // 当前条目中存有的index
+	} else if i >= l.dummyIndex { // 当前条目中存有的index
 		return l.entries[i-l.dummyIndex].Term, nil
 	}
 
@@ -179,11 +179,8 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 }
 
 // 根据 candidate 传来的PreLogTerm 和 PreLogIndex 判断是否比自己的日志序列新
-func (l *RaftLog) isUpToDateAsMe(mPreLogTerm, mPreLogIndex uint64) bool {
-	myLastIndex := l.LastIndex()
-	myLastLogTerm, _ := l.Term(myLastIndex)
-
-	return mPreLogTerm > myLastLogTerm || (mPreLogTerm == myLastLogTerm && myLastIndex <= mPreLogIndex)
+func (l *RaftLog) isUpToDateAsMe(mLastLogTerm, mLastLogIndex uint64) bool {
+	return mLastLogTerm > l.LastTerm() || (mLastLogTerm == l.LastTerm() && mLastLogIndex >= l.LastIndex())
 }
 
 // truncate掉冲突的日志序列，保留前面的
@@ -206,4 +203,15 @@ func (l *RaftLog) maybeCommit(readyCommitIndex, term uint64) bool {
 	}
 
 	return false
+}
+
+// 返回 index 在 [start,end) 中的entries
+// end = 0 : 表示获取[start:]的日志
+func (l *RaftLog) getEntries(start, end uint64) []pb.Entry {
+	if end == 0 {
+		end = l.LastIndex() + 1
+	}
+
+	start, end = start-l.dummyIndex, end-l.dummyIndex
+	return l.entries[start:end]
 }
