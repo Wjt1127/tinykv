@@ -43,7 +43,7 @@ const (
 type Msg struct {
 	Type     MsgType
 	RegionID uint64
-	Data     interface{}
+	Data     interface{} // 可以是上面 Msg 类型中的任意类型
 }
 
 func NewMsg(tp MsgType, data interface{}) Msg {

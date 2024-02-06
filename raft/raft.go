@@ -674,7 +674,7 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 
 // handleAppendEntriesResponse 中调用的，用于确定接收到的回复是否可以更新Match和NextIndex，进而确认是否可能造成 commitIndex 的更新
 func (r *Raft) appendResponseHelperMaybeUpdate(from, index uint64) bool {
-	update := false // 不用跟新，表明是过期的消息回复
+	update := false // 不用更新，表明是过期的消息回复
 	if r.Prs[from].Match < index {
 		r.Prs[from].Match = index
 		r.Prs[from].Next = index + 1

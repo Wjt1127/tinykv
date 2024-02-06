@@ -173,7 +173,7 @@ func (rn *RawNode) Step(m pb.Message) error {
 // Ready returns the current point-in-time state of this RawNode.
 // Ready entry 存的其实就是当前 RawNode 的一些信息状态
 // 看了测试之后的理解：应该是需要先通过 HasReady 去判断是否有需要上层处理的（持久化、apply、处理消息等）
-// 然后调用 Ready 向上层传递当前的
+// 然后调用 Ready 向上层传递当前的 Ready 状态
 // 然后再调用 Advance 通知 RawNode 上次的这个 Ready 已经处理完了，RawNode更新相应状态信息
 func (rn *RawNode) Ready() Ready {
 	// Your Code Here (2A).

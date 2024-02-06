@@ -6,6 +6,10 @@ import (
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
 )
 
+/*
+ * raft worker 轮询 raftCh 以获得消息，这些消息包括驱动 Raft 模块的基本 tick 和作为 Raft 日志项的 Raft 命令；
+ */
+
 // raftWorker is responsible for run raft commands and apply raft logs.
 type raftWorker struct {
 	pr *router
@@ -38,7 +42,7 @@ func (rw *raftWorker) run(closeCh <-chan struct{}, wg *sync.WaitGroup) {
 		select {
 		case <-closeCh:
 			return
-		case msg := <-rw.raftCh:
+		case msg := <-rw.raftCh: // 接受各种 Msg : 其中包括tick、raft间的同步消息、上层应用的msg等等
 			msgs = append(msgs, msg)
 		}
 		pending := len(rw.raftCh)
@@ -51,7 +55,7 @@ func (rw *raftWorker) run(closeCh <-chan struct{}, wg *sync.WaitGroup) {
 			if peerState == nil {
 				continue
 			}
-			newPeerMsgHandler(peerState.peer, rw.ctx).HandleMsg(msg)
+			newPeerMsgHandler(peerState.peer, rw.ctx).HandleMsg(msg) // 将 msg 转化为 entry ，进而转交给 raft 层去处理
 		}
 		for _, peerState := range peerStateMap {
 			newPeerMsgHandler(peerState.peer, rw.ctx).HandleRaftReady()

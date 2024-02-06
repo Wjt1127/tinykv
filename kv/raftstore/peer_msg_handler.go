@@ -2,20 +2,30 @@ package raftstore
 
 import (
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/log"
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
+
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
 	"github.com/pingcap-incubator/tinykv/scheduler/pkg/btree"
 	"github.com/pingcap/errors"
 )
+
+/*
+ * raftstore 从 Raft 模块获得并处理 ready，包括发送 raft 消息、持久化状态、将提交的日志项应用到状态机。
+ * 一旦应用，通过回调函数将响应返回给客户。
+ */
 
 type PeerTick int
 
@@ -38,21 +48,222 @@ func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
 	}
 }
 
+/* HandleRaftReady 处理 rawNode 传递来的 Ready
+ * HandleRaftReady 对这些 entries 进行 apply（即执行底层读写命令）
+ * 每执行完一次 apply，都需要对 proposals 中的相应 Index 的 proposal 进行 callback 回应（调用 cb.Done()）
+ * 然后从中删除这个 proposal。
+ */
 func (d *peerMsgHandler) HandleRaftReady() {
 	if d.stopped {
 		return
 	}
 	// Your Code Here (2B).
+
+	// 1. 没有 Ready 提交给上层应用，什么都不处理，直接返回
+	if !d.RaftGroup.HasReady() {
+		return
+	}
+
+	ready := d.RaftGroup.Ready()
+	// 2. 调用 SaveReadyState 将 Ready 中需要持久化的内容保存到 badger。
+	// 如果 Ready 中存在 snapshot，则应用这个 snapshot；
+	// 保存 unstable entries, hard state, snapshot
+	applySnapResult, err := d.peerStorage.SaveReadyState(&ready)
+	if err != nil {
+		log.Panic(err)
+	}
+	// 如果有 snapshot 存在，应用它
+	if applySnapResult != nil {
+		if !reflect.DeepEqual(applySnapResult.PrevRegion, applySnapResult.Region) {
+			d.peerStorage.SetRegion(applySnapResult.Region)
+			storeMeta := d.ctx.storeMeta
+			storeMeta.Lock()
+			storeMeta.regions[applySnapResult.Region.Id] = applySnapResult.Region
+			storeMeta.regionRanges.Delete(&regionItem{applySnapResult.PrevRegion})
+			storeMeta.regionRanges.ReplaceOrInsert(&regionItem{applySnapResult.Region})
+			storeMeta.Unlock()
+		}
+	}
+
+	// 3. Ready中还可能包含的是 Msg，需要发送给同 Region 中的其他 peer
+	d.Send(d.ctx.trans, ready.Messages)
+
+	// 4. apply Ready 中的 commitEntries
+	if len(ready.CommittedEntries) > 0 {
+		// 需要使用 kvWB 去应用这些 kv 键值对的读/写操作
+		kvWB := &engine_util.WriteBatch{}
+		for _, ent := range ready.CommittedEntries {
+			// 对需要 apply 的 Entry 进行处理，并在完成后调用 callback 函数通知 client
+			kvWB = d.processCommittedEntry(&ent, kvWB) // 将需要处理的 Kv write缓存在一个 writeBatch 结构体中
+			// 节点有可能在 processCommittedEntry 返回之后就销毁了
+			// 如果销毁了需要直接返回，保证对这个节点而言不会再 DB 中写入数据
+			if d.stopped {
+				return
+			}
+		}
+		// 更新 RaftApplyState
+		lastEntry := ready.CommittedEntries[len(ready.CommittedEntries)-1]
+		d.peerStorage.applyState.AppliedIndex = lastEntry.Index
+		if err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState); err != nil {
+			log.Panic(err)
+		}
+		// 在这里一次性执行所有的 Command 操作和 ApplyState 更新操作，将写操作批处理
+		kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
+	}
+
+	//5. 调用 d.RaftGroup.Advance() 推进 RawNode,更新 raft 状态
+	d.RaftGroup.Advance(ready)
+}
+
+// 在 raftStore 层处理由 RawNode 层提交上来的 Ready 中的committedEntry，在应用中 apply 这些 Entry 的请求
+func (d *peerMsgHandler) processCommittedEntry(entry *pb.Entry, kvWB *engine_util.WriteBatch) *engine_util.WriteBatch {
+	// 首先检查 EntryType 是 EntryConfChange 还是 EntryNormal
+	if entry.EntryType == pb.EntryType_EntryConfChange {
+		confChange := &pb.ConfChange{}
+		// unmarshal 就是 server-stub 中的反序列化函数
+		if err := confChange.Unmarshal(entry.Data); err != nil {
+			log.Panic(err)
+		}
+		log.Infof("EntryType_EntryConfChange")
+		return d.processConfChange(entry, confChange, kvWB)
+	}
+
+	// 下面处理的就是需要 apply 的日志条目，这些条目需要转化为request然后在应用层执行
+	requests := &raft_cmdpb.RaftCmdRequest{}
+	if err := requests.Unmarshal(entry.Data); err != nil { // 解析 entry.Data 中的数据
+		log.Panic(err)
+	}
+
+	// 判断是普通 request 还是 AdminRequest
+	if requests.AdminRequest != nil {
+		return d.processAdminRequest(entry, requests, kvWB)
+	} else {
+		return d.processNormalRequest(entry, requests, kvWB)
+	}
+}
+
+// HandleRaftReady 中处理 Ready 中需要 Apply 的 committedEntry 中的 Normal request（invalid/get/put/delete/snap操作）
+func (d *peerMsgHandler) processNormalRequest(entry *pb.Entry, requests *raft_cmdpb.RaftCmdRequest, kvWB *engine_util.WriteBatch) *engine_util.WriteBatch {
+	// NormalRequestResponse 只需要对这两个变量赋值
+	resp := &raft_cmdpb.RaftCmdResponse{
+		Header:    &raft_cmdpb.RaftResponseHeader{},
+		Responses: make([]*raft_cmdpb.Response, 0),
+	}
+
+	// 处理一次请求中包含的所有操作，对于 Get/Put/Delete 操作首先检查 Key 是否在 Region 中
+	for _, req := range requests.Requests {
+		switch req.CmdType {
+		// Get 操作
+		case raft_cmdpb.CmdType_Get:
+			key := req.Get.Key
+			// 检查这个 request 对应的 key 是不是在本 peer 所属的 region 中
+			if err := util.CheckKeyInRegion(key, d.Region()); err != nil {
+				BindRespError(resp, err)
+			} else { // key 在本 region 中
+				// Get 和 Snap 请求需要先将之前的结果写到 DB
+				kvWB.MustWriteToDB(d.peerStorage.Engines.Kv) // 因为 requests 中可能有读请求在写请求后
+				kvWB = &engine_util.WriteBatch{}             // kvWB 是缓存 writeBtach 的结构体
+				value, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
+				// 返回给 client 的请求 response
+				resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Get,
+					Get:     &raft_cmdpb.GetResponse{Value: value},
+				})
+			}
+		case raft_cmdpb.CmdType_Put:
+			key := req.Put.Key
+			// 同样需要判断是否在本 region 中
+			if err := util.CheckKeyInRegion(key, d.Region()); err != nil {
+				BindRespError(resp, err)
+			} else {
+				kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
+				resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Put,
+					Put:     &raft_cmdpb.PutResponse{},
+				})
+			}
+		case raft_cmdpb.CmdType_Delete:
+			key := req.Delete.Key
+			if err := util.CheckKeyInRegion(key, d.Region()); err != nil {
+				BindRespError(resp, err)
+			} else {
+				kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
+				resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Delete,
+					Delete:  &raft_cmdpb.DeleteResponse{},
+				})
+			}
+		case raft_cmdpb.CmdType_Snap:
+			if requests.Header.RegionEpoch.Version != d.Region().RegionEpoch.Version {
+				BindRespError(resp, &util.ErrEpochNotMatch{})
+			} else {
+				// Get 和 Snap 请求需要先将结果写到 DB，否则的话如果有多个 entry 同时被 apply，客户端无法及时看到写入的结果
+				kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
+				kvWB = &engine_util.WriteBatch{}
+				resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Snap,
+					Snap:    &raft_cmdpb.SnapResponse{Region: d.Region()},
+				})
+			}
+		}
+	}
+
+	// 处理完 RawNode 给上层的 Ready 中需要 apply 的 NormalRequest 后，需要调用 proposal 中对应索引的 callback 函数通知client 这个请求被处理了
+	// 这个 callback 对应的索引就是 term 和 index，上层应用对 raft-server 进行 proposal 的时候，如果在 leader 节点收到，会分配对应的 term 和index的
+	d.callbackAfterProcessCmds(entry, resp)
+	return kvWB
+}
+
+// callback函数记录在 peer 结构体的 proposals[] 中，使用 term + Index 作为唯一标识判断是否是这个 entry 对应的 callback
+func (d *peerMsgHandler) callbackAfterProcessCmds(entry *pb.Entry, resp *raft_cmdpb.RaftCmdResponse) {
+	// 1. 找到 entry 对应的回调函数（proposal），存入操作的执行结果（resp）
+	// 2. 有可能会找到过期的回调（term 比较小或者 index 比较小），此时应该使用 Stable Command 响应并从回调数组中删除 proposal
+	// 3. 其他情况：正确匹配的 proposal（处理完毕之后应该立即结束），further proposal（直接返回）
+
+	for len(d.proposals) > 0 {
+		// 可能是由于领导者变更，导致某些日志未提交并被新领导者的日志覆盖。
+		// 但客户并不知道这一点，仍在等待回复。因此，应该返回 ErrStaleCommand 信息以让客户端知道并再次重试该命令。
+		proposal := d.proposals[0]
+		if proposal.term < entry.Term || proposal.index < entry.Index { // stalecommand
+			// 日志冲突，然后冲突后的entry被截断的情况
+			NotifyStaleReq(proposal.term, proposal.cb)
+			d.proposals = d.proposals[1:]
+			continue
+		}
+
+		// 正确匹配到对应的proposal
+		if proposal.term == entry.Term && proposal.index == entry.Index {
+			if proposal.cb != nil {
+				proposal.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false) // snap resp should set txn explicitly
+			}
+			proposal.cb.Done(resp)
+			d.proposals = d.proposals[1:]
+		}
+		// further proposal（即当前的 entry 并没有 proposal 在等待，或许是因为现在是 follower 在处理 committed entry）
+		return
+	}
+}
+
+// HandleRaftReady 中处理 Ready 中需要 Apply 的 committedEntry 中的 Normal request（invalid/get/put/delete/snap操作）
+func (d *peerMsgHandler) processAdminRequest(entry *pb.Entry, requests *raft_cmdpb.RaftCmdRequest, kvWB *engine_util.WriteBatch) *engine_util.WriteBatch {
+	return nil
+}
+
+// HandleRaftReady 中处理 Ready 中需要持久化的 Entry 条目，这个 Entry 条目是 confChangeType 类型的
+func (d *peerMsgHandler) processConfChange(entry *pb.Entry, confChange *pb.ConfChange, kvWB *engine_util.WriteBatch) *engine_util.WriteBatch {
+
+	return nil
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
 	switch msg.Type {
 	case message.MsgTypeRaftMessage:
-		raftMsg := msg.Data.(*rspb.RaftMessage)
+		raftMsg := msg.Data.(*rspb.RaftMessage) // 类型断言：将msg.Data的底层值以*rspb.RaftMessage的形势取出
+		// 在 d.onRaftMsg 中处理了这个来自同 raftGroup 中其他节点 peer 的 Msg（也许是heartBeat、RequestVote、AppendEntry消息等）
 		if err := d.onRaftMsg(raftMsg); err != nil {
 			log.Errorf("%s handle raft message error %v", d.Tag, err)
 		}
-	case message.MsgTypeRaftCmd:
+	case message.MsgTypeRaftCmd: // 上层应用的 kv 指令：可能是NormalCmd（put、get、snapshot、delete）或 AdminCmd
 		raftCMD := msg.Data.(*message.MsgRaftCmd)
 		d.proposeRaftCommand(raftCMD.Request, raftCMD.Callback)
 	case message.MsgTypeTick:
@@ -78,6 +289,7 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 	}
 
 	// Check whether the store has the right peer to handle the request.
+	// 检查这个 peer 是不是 Leader，只有 Leader 才处理 client 的请求
 	regionID := d.regionId
 	leaderID := d.LeaderId()
 	if !d.IsLeader() {
@@ -107,13 +319,47 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 	return err
 }
 
+// 将 client 的请求(Requests是一个数组，可能是一组操作)包装成 entry 传递给 raft 层
+// 所以一个 entry 可能是一批操作形成的日志
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	// 检查各种信息查看是否 term 过时了，或者发错节点了，或者发送的这个peer不是leader
 	err := d.preProposeRaftCommand(msg)
 	if err != nil {
 		cb.Done(ErrResp(err))
 		return
 	}
 	// Your Code Here (2B).
+	if msg.AdminRequest != nil {
+		d.proposeAdminRequest(msg, cb)
+	} else {
+		d.proposeNormalRequest(msg, cb)
+	}
+}
+
+func (d *peerMsgHandler) proposeAdminRequest(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+
+}
+
+// 将普通 request 封装成 entry 传递给 RawNode 进行处理
+// 回调函数的term 和 index 是和该 leader 节点中对应的 logEntry 中一样
+func (d *peerMsgHandler) proposeNormalRequest(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	//1. 封装回调，等待log被apply的时候调用
+	//后续相应的 entry 执行完毕后，响应该 proposal，即 callback.Done( )；
+	d.proposals = append(d.proposals, &proposal{
+		index: d.RaftGroup.Raft.RaftLog.LastIndex() + 1,
+		term:  d.RaftGroup.Raft.Term,
+		cb:    cb,
+	})
+	//2. 序列化RaftCmdRequest
+	data, err := msg.Marshal()
+	if err != nil {
+		log.Panic(err)
+	}
+	//3. 将该字节流包装成 entry 传递给下层raft MessageType_MsgPropose
+	err = d.RaftGroup.Propose(data)
+	if err != nil {
+		log.Panic(err)
+	}
 }
 
 func (d *peerMsgHandler) onTick() {
@@ -223,9 +469,9 @@ func (d *peerMsgHandler) validateRaftMessage(msg *rspb.RaftMessage) bool {
 	return true
 }
 
-/// Checks if the message is sent to the correct peer.
-///
-/// Returns true means that the message can be dropped silently.
+// / Checks if the message is sent to the correct peer.
+// /
+// / Returns true means that the message can be dropped silently.
 func (d *peerMsgHandler) checkMessage(msg *rspb.RaftMessage) bool {
 	fromEpoch := msg.GetRegionEpoch()
 	isVoteMsg := util.IsVoteMessage(msg.Message)
