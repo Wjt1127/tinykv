@@ -244,9 +244,26 @@ func (d *peerMsgHandler) callbackAfterProcessCmds(entry *pb.Entry, resp *raft_cm
 	}
 }
 
-// HandleRaftReady 中处理 Ready 中需要 Apply 的 committedEntry 中的 Normal request（invalid/get/put/delete/snap操作）
+// HandleRaftReady 中处理 Ready 中需要 Apply 的 committedEntry 中的 Admin request（compactLog/Region Split/操作）
 func (d *peerMsgHandler) processAdminRequest(entry *pb.Entry, requests *raft_cmdpb.RaftCmdRequest, kvWB *engine_util.WriteBatch) *engine_util.WriteBatch {
-	return nil
+	adminReq := requests.AdminRequest
+	switch adminReq.CmdType {
+	// CompactLogRequest 是修改元数据，即更新RaftApplyState 中的 RaftTruncatedState。
+	// 之后，通过ScheduleCompactLog 给 raftlog-gc worker 安排一个任务。
+	// Raftlog-gc worker 将以异步方式进行实际的日志删除工作。
+	case raft_cmdpb.AdminCmdType_CompactLog:
+		// CompactLog 类型请求不需要将执行结果存储到 proposal 回调,
+		// 因为这个 CompactLog 相当于是raft 模块内部到达阈值被动触发的，而不是client提出的
+		if adminReq.CompactLog.CompactIndex > d.peerStorage.applyState.TruncatedState.Index {
+			// 记录最后一条被截断的日志（快照中的最后一条日志）的索引和任期
+			truncatedState := d.peerStorage.applyState.TruncatedState
+			truncatedState.Index, truncatedState.Term = adminReq.CompactLog.CompactIndex, adminReq.CompactLog.CompactTerm
+			// 调度日志截断任务到 raftlog-gc worker
+			d.ScheduleCompactLog(adminReq.CompactLog.CompactIndex)
+			log.Infof("%d apply commit, entry %v, type %s, truncatedIndex %v", d.peer.PeerId(), entry.Index, adminReq.CmdType, adminReq.CompactLog.CompactIndex)
+		}
+	}
+	return kvWB
 }
 
 // HandleRaftReady 中处理 Ready 中需要持久化的 Entry 条目，这个 Entry 条目是 confChangeType 类型的
@@ -396,6 +413,7 @@ func (d *peerMsgHandler) onRaftBaseTick() {
 	d.ticker.schedule(PeerTickRaft)
 }
 
+// 实际上是从上一次的 LastCompactedIndex 到本次的 truncatedIndex 之间的 log 做compact
 func (d *peerMsgHandler) ScheduleCompactLog(truncatedIndex uint64) {
 	raftLogGCTask := &runner.RaftLogGCTask{
 		RaftEngine: d.ctx.engine.Raft,
@@ -649,12 +667,16 @@ func (d *peerMsgHandler) findSiblingRegion() (result *metapb.Region) {
 	return
 }
 
+// 向 Leader 发出 logCompact（属于AdminRequest） 请求，用 proposeRaftCommand 提出
+// logCompact 和 do_snapshot 是两个东西，logCompact 是 Leader 执行无用 Log 的删除操作，并修改相关元数据信息，同时将操作propose到其他节点
+// 而 do_snapshot 是上层应用去生成的，raft 模块并不能生成快照，因为 raft 模块不知道数据的结构和格式，需要由上层应用生成
 func (d *peerMsgHandler) onRaftGCLogTick() {
 	d.ticker.schedule(PeerTickRaftLogGC)
 	if !d.IsLeader() {
 		return
 	}
 
+	// 获取firstIndex 和 appliedIndex
 	appliedIdx := d.peerStorage.AppliedIndex()
 	firstIdx, _ := d.peerStorage.FirstIndex()
 	var compactIdx uint64

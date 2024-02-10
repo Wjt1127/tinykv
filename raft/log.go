@@ -111,6 +111,14 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	// compact后持久存储中的第一个日志index作为新的dummyIndex
+	newfirstIndex, _ := l.storage.FirstIndex()
+	if newfirstIndex > l.dummyIndex {
+		newEntries := l.entries[newfirstIndex-l.dummyIndex:]
+		l.entries = make([]pb.Entry, 0)
+		l.entries = append(l.entries, newEntries...)
+		l.dummyIndex = newfirstIndex
+	}
 }
 
 // allEntries return all the entries not compacted.
