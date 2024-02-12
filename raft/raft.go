@@ -161,7 +161,8 @@ type Raft struct {
 	// Follow the procedure defined in section 3.10 of Raft phd thesis.
 	// (https://web.stanford.edu/~ouster/cgi-bin/papers/OngaroPhD.pdf)
 	// (Used in 3A leader transfer)
-	leadTransferee uint64
+	leadTransferee    uint64
+	transfereeElapsed uint64
 
 	// Only one conf change may be pending (in the log, but not yet
 	// applied) at a time. This is enforced via PendingConfIndex, which
@@ -170,7 +171,7 @@ type Raft struct {
 	// be proposed if the leader's applied index is greater than this
 	// value.
 	// (Used in 3A conf change)
-	PendingConfIndex uint64 // 记录配置文件修改的entry index
+	PendingConfIndex uint64 // 记录配置文件修改的 entry index
 
 	// 增加一个随机 electionTimeOut
 	randomElectionTimeOutTick int
@@ -252,6 +253,15 @@ func (r *Raft) leaderTick() {
 		// 我觉得也可以 append 到r.msg中
 		r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat, From: r.id, To: r.id, Term: r.Term}) // 提醒leader去发心跳包
 	}
+
+	// 3A：transferee 失败
+	if r.leadTransferee != None {
+		// leader 转移失败，目标节点可能挂了，放弃转移，恢复客户端的请求propose回应
+		if r.transfereeElapsed >= 2*uint64(r.electionTimeout) {
+			r.leadTransferee = None
+		}
+	}
+
 }
 
 func (r *Raft) candiateTick() {
@@ -386,7 +396,8 @@ func (r *Raft) leaderStep(m pb.Message) error {
 		r.handleRequestVote(m)
 	case pb.MessageType_MsgTransferLeader:
 		// 转换 Leadership
-		// project 3
+		// project 3A
+		r.handleTransferLeader(m)
 	}
 
 	return nil
@@ -401,6 +412,7 @@ func (r *Raft) candidateStep(m pb.Message) error {
 	// 5. MsgTimeOutNow: 让非 Leader 节点立即选举超时，开启一轮选举；上层做的转移 leadership 的 RPC
 	// 6. MsgAppendEntry: 接收到 Append Entry RPC
 	// 7. MessageType_MsgSnapshot：接收 snapshot 然后等待 RawNode 提交 Ready 进行应用
+	// 8. MessageType_MsgTransferLeader: 非leader节点收到只需要转发到leader
 	switch m.MsgType {
 	case pb.MessageType_MsgHup:
 		r.handleHup(m)
@@ -416,6 +428,8 @@ func (r *Raft) candidateStep(m pb.Message) error {
 		r.handleTimeOutNow(m)
 	case pb.MessageType_MsgSnapshot:
 		r.handleSnapshot(m)
+	case pb.MessageType_MsgTransferLeader:
+		r.handleTransferLeader(m)
 	}
 	return nil
 }
@@ -428,6 +442,7 @@ func (r *Raft) followerStep(m pb.Message) error {
 	// 4. MsgRequestVote: 收到来自 candidate 的投票请求
 	// 5. MsgTimeOutNow: 让非 Leader 节点立即选举超时，开启一轮选举；上层做的转移 leadership 的 RPC
 	// 6. MessageType_MsgSnapshot：接收 snapshot 然后等待 RawNode 提交 Ready 进行应用
+	// 7. MessageType_MsgTransferLeader: 非leader节点收到只需要转发到leader
 	switch m.MsgType {
 	case pb.MessageType_MsgHup:
 		r.handleHup(m)
@@ -441,9 +456,57 @@ func (r *Raft) followerStep(m pb.Message) error {
 		r.handleTimeOutNow(m)
 	case pb.MessageType_MsgSnapshot:
 		r.handleSnapshot(m)
+	case pb.MessageType_MsgTransferLeader:
+		r.handleTransferLeader(m)
 	}
 
 	return nil
+}
+
+// 上层发送 TransferLeader 消息给 leader，要求其转换 leader 为 m.from
+// 当 leader 要转换时，首先需要把 r.leadTransferee 置为 m.From，表明转换操作正在执行。
+// 接着，会判断目标节点的日志是否和自己一样新，如果是，就给它发一个 MsgTimeoutNow，
+// 如果不是，就先 append 同步日志，然后再发送 MsgTimeoutNow。当节点收到 MsgTimeoutNow 后，
+// 立刻开始选举，因为它的日志至少和原 leader 一样新，所以一定会选举成功。
+// 当 leader 正在进行转换操作时，所有的 propose 请求均被拒绝。
+func (r *Raft) handleTransferLeader(m pb.Message) {
+	if r.Lead != m.To { // 如果这条消息的接收者不是 leader，需要转发到 leader
+		m.To = r.Lead
+		r.msgs = append(r.msgs, m) // 转发到 leader 那去
+		return
+	}
+
+	// 判断 transferee 的对象是否在集群中
+	if _, ok := r.Prs[m.From]; !ok {
+		log.Warnf("Transferee %d is not in this Cluster", m.From)
+		return
+	}
+
+	// 如果Transferee 就是 leader 本身，那就不用做处理
+	if m.From == r.id {
+		return
+	}
+
+	// 判断是否有转让流程正在进行，如果是相同节点的转让流程就返回，否则的话终止上一个转让流程
+	if r.leadTransferee != None {
+		if r.leadTransferee == m.From {
+			return
+		}
+		// 否则就停止上一个流程
+		r.leadTransferee = None
+	}
+
+	// 转换操作正在执行
+	r.leadTransferee = m.From
+	r.transfereeElapsed = 0
+
+	// 如果transferee对象的日志和leader一样新，那么向他发送 MsgTimeOutNow
+	if r.Prs[m.From].Match == r.RaftLog.LastIndex() {
+		r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgTimeoutNow, From: r.id, To: m.From})
+	} else { // 如果不是最新的日志，需要leader先通过 appendEntry 同步日志，再发 MsgTimeOutNow
+		r.sendAppend(m.From)
+		// 发送 MsgTimeOutNow 的流程需要在收到 appendEntryResponse 消息后根据 r.leadTransferee 再发送
+	}
 }
 
 // Leader send MsgHeartBeat to other nodes
@@ -474,6 +537,12 @@ func (r *Raft) handlePropose(m pb.Message) {
 		}
 	}
 	r.RaftLog.appendEntries(m.Entries)
+
+	// 3A：当 leader 正在进行转换操作时，所有的 propose 请求均被拒绝
+	// 在这里 leader 还是先持久化这条 message 但是不会同步其他节点
+	if r.leadTransferee != None {
+		return
+	}
 
 	// append之后自己的Next需要调整，测试测到了
 	r.Prs[r.id].Match = r.RaftLog.LastIndex() // 自己和自己的匹配
@@ -676,6 +745,11 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 		if r.appendResponseHelperMaybeCommit() { // 判断是否可以修改 commitIndex，只有本任期内的commitIndex才能提交
 			r.bcastAppendEntry()
 		}
+	}
+
+	// 3A：在Leader和transferee同步日志后，向r.leadTransferee 发送 MsgTimeOutNow
+	if r.leadTransferee != None && r.Prs[r.leadTransferee].Match == r.RaftLog.LastIndex() {
+		r.msgs = append(r.msgs, pb.Message{MsgType: pb.MessageType_MsgTimeoutNow, From: r.id, To: r.leadTransferee})
 	}
 }
 
@@ -921,12 +995,30 @@ func (r *Raft) sendHeartbeat(to uint64) {
 }
 
 /* *************** Node management in raft group ********************* */
+/* 在 raft 层中，这两各操作仅仅会影响到 r.Prs[ ]，因此新增节点就加一个，删除节点就少一个 */
+
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	if _, ok := r.Prs[id]; !ok {
+		r.Prs[id] = &Progress{Next: r.RaftLog.LastIndex() + 1}
+		r.PendingConfIndex = None // 清除 PendingConfIndex 表示当前没有未完成的配置更新
+	}
 }
 
 // removeNode remove a node from raft group
+// 需要额外计算 commitedIndex
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	if _, ok := r.Prs[id]; ok {
+		delete(r.Prs, id)
+		// 如果是删除节点，由于有节点被移除了，这个时候可能有新的日志可以提交
+		// 这是必要的，因为 TinyKV 只有在 handleAppendRequestResponse 的时候才会判断是否有新的日志可以提交
+		// 如果节点被移除了，则可能会因为缺少这个节点的回复，导致可以提交的日志无法在当前任期被提交
+		if r.State == StateLeader && r.appendResponseHelperMaybeCommit() {
+			log.Infof("[removeNode commit] %v leader commit new entry, commitIndex %v", r.id, r.RaftLog.committed)
+			r.bcastAppendEntry() // 广播更新所有 follower 的 commitIndex
+		}
+	}
+	r.PendingConfIndex = None // 清除 PendingConfIndex 表示当前没有未完成的配置更新
 }
