@@ -288,6 +288,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.Lead = lead
 	r.State = StateFollower
 	r.electionElapsed = 0
+	r.leadTransferee = None
 	r.setRandomElectionTime()
 }
 
@@ -399,6 +400,7 @@ func (r *Raft) candidateStep(m pb.Message) error {
 	// 4. MsgRequestVote: 可能收到来自其他 candidate 的投票请求，拒绝就行
 	// 5. MsgTimeOutNow: 让非 Leader 节点立即选举超时，开启一轮选举；上层做的转移 leadership 的 RPC
 	// 6. MsgAppendEntry: 接收到 Append Entry RPC
+	// 7. MessageType_MsgSnapshot：接收 snapshot 然后等待 RawNode 提交 Ready 进行应用
 	switch m.MsgType {
 	case pb.MessageType_MsgHup:
 		r.handleHup(m)
@@ -412,6 +414,8 @@ func (r *Raft) candidateStep(m pb.Message) error {
 		r.handleRequestVote(m)
 	case pb.MessageType_MsgTimeoutNow:
 		r.handleTimeOutNow(m)
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	}
 	return nil
 }
@@ -423,6 +427,7 @@ func (r *Raft) followerStep(m pb.Message) error {
 	// 3. MsgAppendEntry: 收到了来自 Leader 的日志同步
 	// 4. MsgRequestVote: 收到来自 candidate 的投票请求
 	// 5. MsgTimeOutNow: 让非 Leader 节点立即选举超时，开启一轮选举；上层做的转移 leadership 的 RPC
+	// 6. MessageType_MsgSnapshot：接收 snapshot 然后等待 RawNode 提交 Ready 进行应用
 	switch m.MsgType {
 	case pb.MessageType_MsgHup:
 		r.handleHup(m)
@@ -434,6 +439,8 @@ func (r *Raft) followerStep(m pb.Message) error {
 		r.handleRequestVote(m)
 	case pb.MessageType_MsgTimeoutNow:
 		r.handleTimeOutNow(m)
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	}
 
 	return nil
@@ -737,8 +744,55 @@ func (r *Raft) handleHup(m pb.Message) {
 }
 
 // handleSnapshot handle Snapshot RPC request
+// 从 SnapshotMetadata 中恢复 Raft 的内部状态，例如 term、commit、membership information
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+
+	// 因为获取 snapshot 的起源就是因为 leader 的 AppendEntries
+	// 所以 response 返回的 MsgType 就是
+	snapshotResponse := pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		From:    r.id,
+		Term:    r.Term,
+	}
+	meta := m.Snapshot.Metadata
+
+	// 如果 Leader 的 Term 比自己还小，reply false
+	if m.Term < r.Term {
+		snapshotResponse.Reject = true
+	} else if r.RaftLog.committed >= meta.Index { // 如果snapshot的最后一个logIndex 没有比自己的更新
+		snapshotResponse.Reject = true
+		snapshotResponse.Index = r.RaftLog.committed
+	} else { // 这种情况就是落后版本太多，需要从 leader 那 install snapshot
+		r.becomeFollower(m.Term, m.From)
+
+		// 丢弃 snapshot 之前的所有 entry
+		if meta.Index >= r.RaftLog.LastIndex() {
+			r.RaftLog.entries = nil
+		} else {
+			r.RaftLog.entries = r.RaftLog.entries[meta.Index+1:]
+		}
+
+		// 更新日志数据
+		r.RaftLog.dummyIndex = meta.Index + 1 // snapshot 是被应用的最后一条log，其余的log需要进一步的append
+		r.RaftLog.committed = meta.Index
+		r.RaftLog.applied = meta.Index
+		r.RaftLog.stabled = meta.Index
+		r.RaftLog.pendingSnapshot = m.Snapshot
+
+		// 按照snapshot中的所有信息更新本节点的集群配置
+		r.Prs = make(map[uint64]*Progress)
+		for _, id := range meta.ConfState.Nodes {
+			r.Prs[id] = &Progress{}
+			r.Prs[id].Next = r.RaftLog.LastIndex() + 1
+			r.Prs[id].Match = 0
+		}
+
+		// 更新 response，提示 leader 更新 nextIndex
+		snapshotResponse.Index = meta.Index
+	}
+
+	r.msgs = append(r.msgs, snapshotResponse)
 }
 
 // handleHeartbeat handle Heartbeat RPC request
@@ -810,14 +864,45 @@ func (r *Raft) sendAppend(to uint64) bool {
 		return true
 	}
 
-	// 如果错误，且错误的信息是说明在snapshot中
-	if err == ErrCompacted {
-		// 发送 snapshot 给 follower
-
-		log.Infof("[Snapshot Request] from %d to %d, prevLogIndex %v, dummyIndex %v", r.id, to, prevLogIndex, r.RaftLog.dummyIndex)
-	}
+	// 如果错误，说明在snapshot中
+	// 发送 snapshot 给 follower
+	r.sendSnapshot(to)
+	log.Infof("[Snapshot Request] from %d to %d, prevLogIndex %v, dummyIndex %v", r.id, to, prevLogIndex, r.RaftLog.dummyIndex)
 
 	return false
+}
+
+// 当 Leader 向其他 followers AppendEntries 的时候，发现follower落后的有点多，那么需要发送 snapshot
+func (r *Raft) sendSnapshot(to uint64) {
+	snapshot, err := r.RaftLog.storage.Snapshot()
+
+	if err != nil {
+		// 生成 Snapshot 的工作是由 region worker 异步执行的，如果 Snapshot 还没有准备好
+		// 此时会返回 ErrSnapshotTemporarilyUnavailable 错误，此时 leader 应该放弃本次 Snapshot Request
+		// 等待下一次再请求 storage 获取 snapshot（通常来说会在下一次 heartbeat response 的时候发送 snapshot）
+
+		/*	TinyKV 项目描述：
+		 *	PeerStorage 实现了Storage.Snapshot()。TinyKV 生成快照并在 Region Worker 中应用快照。
+		 *	当调用 Snapshot() 时，它实际上是向 Region Worker 发送一个任务 RegionTaskGen。
+		 *	region worker 的消息处理程序位于 kv/raftstore/runner/region_task.go 中。
+		 *	它扫描底层引擎以生成快照，并通过通道发送快照元数据。在下一次 Raft 调用 Snapshot时，
+		 *	它会检查快照生成是否完成。如果是，Raft应该将快照信息发送给其他 peer，
+		 *	而快照的发送和接收工作则由 kv/storage/raft_storage/snap_runner.go 处理。
+		 *  Snapshot 是通过 SendSnapshotSock() 方法发送。后面它就会将 Snapshot 切成小块，发送到目标 RaftStore 上面去
+		 */
+
+		return
+	}
+
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType:  pb.MessageType_MsgSnapshot, // 告诉你发了一个snapshot过来了，请你install and apply
+		To:       to,
+		From:     r.id,
+		Term:     r.Term,
+		Snapshot: &snapshot,
+	})
+
+	r.Prs[to].Next = snapshot.Metadata.Index + 1 // 更新 Next 避免下次发送的时候可能又发一次 snapshot
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.

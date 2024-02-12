@@ -52,6 +52,11 @@ func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
  * HandleRaftReady 对这些 entries 进行 apply（即执行底层读写命令）
  * 每执行完一次 apply，都需要对 proposals 中的相应 Index 的 proposal 进行 callback 回应（调用 cb.Done()）
  * 然后从中删除这个 proposal。
+ * 1. 判断是否有新的 Ready，没有就什么都不处理
+ * 2. 调用 SaveReadyState 将 Ready 中需要持久化的内容保存到 badger。如果 Ready 中存在 snapshot，则应用它
+ * 3. 调用 Send 将 Ready 中的 Msg 发出去
+ * 4. Apply Ready 中的 CommittedEntries
+ * 5. 调用 Advance 推进 RawNode
  */
 func (d *peerMsgHandler) HandleRaftReady() {
 	if d.stopped {
@@ -86,7 +91,9 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	}
 
 	// 3. Ready中还可能包含的是 Msg，需要发送给同 Region 中的其他 peer
-	d.Send(d.ctx.trans, ready.Messages)
+	if len(ready.Messages) > 0 {
+		d.Send(d.ctx.trans, ready.Messages)
+	}
 
 	// 4. apply Ready 中的 commitEntries
 	if len(ready.CommittedEntries) > 0 {
@@ -144,6 +151,8 @@ func (d *peerMsgHandler) processCommittedEntry(entry *pb.Entry, kvWB *engine_uti
 
 // HandleRaftReady 中处理 Ready 中需要 Apply 的 committedEntry 中的 Normal request（invalid/get/put/delete/snap操作）
 func (d *peerMsgHandler) processNormalRequest(entry *pb.Entry, requests *raft_cmdpb.RaftCmdRequest, kvWB *engine_util.WriteBatch) *engine_util.WriteBatch {
+	isSnapshotRequest := false
+
 	// NormalRequestResponse 只需要对这两个变量赋值
 	resp := &raft_cmdpb.RaftCmdResponse{
 		Header:    &raft_cmdpb.RaftResponseHeader{},
@@ -205,17 +214,18 @@ func (d *peerMsgHandler) processNormalRequest(entry *pb.Entry, requests *raft_cm
 					Snap:    &raft_cmdpb.SnapResponse{Region: d.Region()},
 				})
 			}
+			isSnapshotRequest = true
 		}
 	}
 
 	// 处理完 RawNode 给上层的 Ready 中需要 apply 的 NormalRequest 后，需要调用 proposal 中对应索引的 callback 函数通知client 这个请求被处理了
 	// 这个 callback 对应的索引就是 term 和 index，上层应用对 raft-server 进行 proposal 的时候，如果在 leader 节点收到，会分配对应的 term 和index的
-	d.callbackAfterProcessCmds(entry, resp)
+	d.callbackAfterProcessCmds(entry, resp, isSnapshotRequest)
 	return kvWB
 }
 
 // callback函数记录在 peer 结构体的 proposals[] 中，使用 term + Index 作为唯一标识判断是否是这个 entry 对应的 callback
-func (d *peerMsgHandler) callbackAfterProcessCmds(entry *pb.Entry, resp *raft_cmdpb.RaftCmdResponse) {
+func (d *peerMsgHandler) callbackAfterProcessCmds(entry *pb.Entry, resp *raft_cmdpb.RaftCmdResponse, isSnapshotCmd bool) {
 	// 1. 找到 entry 对应的回调函数（proposal），存入操作的执行结果（resp）
 	// 2. 有可能会找到过期的回调（term 比较小或者 index 比较小），此时应该使用 Stable Command 响应并从回调数组中删除 proposal
 	// 3. 其他情况：正确匹配的 proposal（处理完毕之后应该立即结束），further proposal（直接返回）
@@ -233,7 +243,7 @@ func (d *peerMsgHandler) callbackAfterProcessCmds(entry *pb.Entry, resp *raft_cm
 
 		// 正确匹配到对应的proposal
 		if proposal.term == entry.Term && proposal.index == entry.Index {
-			if proposal.cb != nil {
+			if isSnapshotCmd {
 				proposal.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false) // snap resp should set txn explicitly
 			}
 			proposal.cb.Done(resp)
@@ -256,11 +266,16 @@ func (d *peerMsgHandler) processAdminRequest(entry *pb.Entry, requests *raft_cmd
 		// 因为这个 CompactLog 相当于是raft 模块内部到达阈值被动触发的，而不是client提出的
 		if adminReq.CompactLog.CompactIndex > d.peerStorage.applyState.TruncatedState.Index {
 			// 记录最后一条被截断的日志（快照中的最后一条日志）的索引和任期
-			truncatedState := d.peerStorage.applyState.TruncatedState
-			truncatedState.Index, truncatedState.Term = adminReq.CompactLog.CompactIndex, adminReq.CompactLog.CompactTerm
+			d.peerStorage.applyState.TruncatedState.Index = adminReq.CompactLog.CompactIndex
+			d.peerStorage.applyState.TruncatedState.Term = adminReq.CompactLog.CompactTerm
+			// 将元数据修改加入 kvWB
+			if err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState); err != nil {
+				log.Panic(err)
+			}
+
 			// 调度日志截断任务到 raftlog-gc worker
 			d.ScheduleCompactLog(adminReq.CompactLog.CompactIndex)
-			log.Infof("%d apply commit, entry %v, type %s, truncatedIndex %v", d.peer.PeerId(), entry.Index, adminReq.CmdType, adminReq.CompactLog.CompactIndex)
+			// log.Infof("%d apply commit, entry %v, type %s, truncatedIndex %v", d.peer.PeerId(), entry.Index, adminReq.CmdType, adminReq.CompactLog.CompactIndex)
 		}
 	}
 	return kvWB
@@ -269,7 +284,7 @@ func (d *peerMsgHandler) processAdminRequest(entry *pb.Entry, requests *raft_cmd
 // HandleRaftReady 中处理 Ready 中需要持久化的 Entry 条目，这个 Entry 条目是 confChangeType 类型的
 func (d *peerMsgHandler) processConfChange(entry *pb.Entry, confChange *pb.ConfChange, kvWB *engine_util.WriteBatch) *engine_util.WriteBatch {
 
-	return nil
+	return kvWB
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -353,8 +368,18 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	}
 }
 
+// propose 上层应用或根据配置信息触发的 AdminRequest
 func (d *peerMsgHandler) proposeAdminRequest(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
-
+	switch msg.AdminRequest.CmdType {
+	case raft_cmdpb.AdminCmdType_CompactLog: // 日志压缩需要提交到 raft 同步
+		data, err := msg.Marshal()
+		if err != nil {
+			log.Panic(err)
+		}
+		if err := d.RaftGroup.Propose(data); err != nil {
+			log.Panic(err)
+		}
+	}
 }
 
 // 将普通 request 封装成 entry 传递给 RawNode 进行处理
@@ -367,7 +392,7 @@ func (d *peerMsgHandler) proposeNormalRequest(msg *raft_cmdpb.RaftCmdRequest, cb
 		term:  d.RaftGroup.Raft.Term,
 		cb:    cb,
 	})
-	//2. 序列化RaftCmdRequest
+	//2. 序列化 RaftCmdRequest
 	data, err := msg.Marshal()
 	if err != nil {
 		log.Panic(err)

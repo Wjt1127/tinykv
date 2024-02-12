@@ -192,6 +192,11 @@ func (rn *RawNode) Ready() Ready {
 		readyEntry.HardState = pb.HardState{Term: rn.Raft.Term, Vote: rn.Raft.Vote, Commit: rn.Raft.RaftLog.committed}
 	}
 
+	// 有 snapshot 需要 apply
+	if !IsEmptySnap(rn.Raft.RaftLog.pendingSnapshot) {
+		readyEntry.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
+	}
+
 	return readyEntry
 }
 
@@ -203,11 +208,13 @@ func (rn *RawNode) HasReady() bool {
 	// 2. 是否有需要持久化的日志（AppendEntry带来的新Entries）
 	// 3. 是否有需要apply的日志（AppendEntry后Leader计算了commitIndex,commit了但是没apply的日志）
 	// 4. 是否有需要发送的Msg
+	// 5. 是否有需要 apply 的 snapshot
 
 	return len(rn.Raft.msgs) > 0 || // 是否有需要处理的Msg
 		rn.isHardStateUpdate() || // 是否有硬状态的变化
 		len(rn.Raft.RaftLog.unstableEntries()) > 0 || // 是否有需要持久化的日志
-		len(rn.Raft.RaftLog.nextEnts()) > 0 // 是否有commited 但是没 apply 的日志
+		len(rn.Raft.RaftLog.nextEnts()) > 0 || // 是否有commited 但是没 apply 的日志
+		!IsEmptySnap(rn.Raft.RaftLog.pendingSnapshot) //是否有需要 apply 的 snapshot
 }
 
 func (rn *RawNode) isSoftStateUpdate() bool {
@@ -247,9 +254,9 @@ func (rn *RawNode) Advance(rd Ready) {
 	if len(rd.CommittedEntries) > 0 {
 		rn.Raft.RaftLog.applied += uint64(len(rd.CommittedEntries))
 	}
-	rn.Raft.RaftLog.maybeCompact()                 // 丢弃被压缩的暂存日志；
-	rn.Raft.RaftLog.pendingSnapshot = nil          // 清空 pendingSnapshot；
-	rn.Raft.msgs = rn.Raft.msgs[len(rd.Messages):] // 清空被处理过的条目
+	rn.Raft.RaftLog.maybeCompact()        // 丢弃被压缩的暂存日志；
+	rn.Raft.RaftLog.pendingSnapshot = nil // 清空 pendingSnapshot, 表示已经将这个 snapshot apply 了
+	rn.Raft.msgs = nil                    // 清空被处理过的条目
 }
 
 // GetProgress return the Progress of this node and its peers, if this

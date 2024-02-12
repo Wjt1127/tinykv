@@ -55,7 +55,11 @@ func (rw *raftWorker) run(closeCh <-chan struct{}, wg *sync.WaitGroup) {
 			if peerState == nil {
 				continue
 			}
-			newPeerMsgHandler(peerState.peer, rw.ctx).HandleMsg(msg) // 将 msg 转化为 entry ，进而转交给 raft 层去处理
+
+			// HandleMsg:  根据 Msg 的类型进行处理
+			// 如果是 raft 层节点间同步的 MsgTypeRaftMessage，那么直接走 raft 层的 step 函数即可
+			// 如果是上层应用 propose 的读写请求，那么走 proposeRaftCommand，先将 requestCmd 转化为 entry 格式，然后再分类处理 AdminRequest(changeConf类型的操作、compact类型) 和 NormalRequest（Get/Put/Delete/Snap）
+			newPeerMsgHandler(peerState.peer, rw.ctx).HandleMsg(msg)
 		}
 		for _, peerState := range peerStateMap {
 			newPeerMsgHandler(peerState.peer, rw.ctx).HandleRaftReady()

@@ -53,7 +53,7 @@ type RaftLog struct {
 
 	// the incoming unstable snapshot, if any.
 	// (Used in 2C)
-	// 待处理快照
+	// 待处理快照, 快照是先 install 到本地但是还没有apply，apply也是需要时间的
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
@@ -99,7 +99,7 @@ func newLog(storage Storage) *RaftLog {
 		applied:         firstIndexInStorage - 1,
 		stabled:         lastIndexInStorage, // 都是从storage中恢复的，一定是stabled
 		entries:         entriesInStorage,
-		pendingSnapshot: &pb.Snapshot{},      // 2A是没有做snapshot的，后面需要
+		pendingSnapshot: nil,                 // 2A是没有做snapshot的，后面需要
 		dummyIndex:      firstIndexInStorage, // 记录的是entries[0]的下标
 	}
 
@@ -117,8 +117,8 @@ func (l *RaftLog) maybeCompact() {
 		newEntries := l.entries[newfirstIndex-l.dummyIndex:]
 		l.entries = make([]pb.Entry, 0)
 		l.entries = append(l.entries, newEntries...)
-		l.dummyIndex = newfirstIndex
 	}
+	l.dummyIndex = newfirstIndex
 }
 
 // allEntries return all the entries not compacted.
@@ -144,7 +144,7 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	if len(l.entries) > 0 {
 		return l.entries[l.applied-l.dummyIndex+1 : l.committed-l.dummyIndex+1]
 	}
-	return nil
+	return make([]pb.Entry, 0)
 }
 
 // 追加新日志，返回最后一条日志index
@@ -174,13 +174,17 @@ func (l *RaftLog) LastTerm() uint64 {
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	if i > l.LastIndex() { // 无效index
-		panic("out of range in Term()")
-	} else if i >= l.dummyIndex { // 当前条目中存有的index
+	if i >= l.dummyIndex {
 		return l.entries[i-l.dummyIndex].Term, nil
 	}
 
-	// 在snapshot中的日志
+	// 存在 pendingSnapshot ，且这个 Index 是在 pendingSnapshot 中的最后一条日志
+	// 因为只能确认最后一个log的index和term
+	if !IsEmptySnap(l.pendingSnapshot) && i == l.pendingSnapshot.Metadata.Index {
+		return l.pendingSnapshot.Metadata.Term, nil
+	}
+
+	// 否则就只能在pendingSnapshot之前已经apply了的snapshot中
 	term, err := l.storage.Term(i)
 
 	return term, err

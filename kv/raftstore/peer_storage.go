@@ -334,6 +334,11 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 }
 
 // Apply the peer with given snapshot
+// 应用一个快照之后 RaftLog 里面只包含了快照中的日志，并且快照中的数据都是已经被应用了的
+// 接收节点在 HandleRaftReady()→SaveReadyState()→ApplySnapshot() 中
+// 根据 pendingSnapshot 的 Metadata 更新自己的 RaftTruncatedState 和 RaftLocalState，
+// 然后发送一个 RegionTaskApply 请求到 region_task.go 中。
+// 此时它会异步的把刚刚收到保存的 Snapshot 应用到 kvDB 中。
 func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_util.WriteBatch, raftWB *engine_util.WriteBatch) (*ApplySnapResult, error) {
 	log.Infof("%v begin to apply snapshot", ps.Tag)
 	snapData := new(rspb.RaftSnapshotData)
@@ -344,7 +349,60 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// Hint: things need to do here including: update peer storage state like raftState and applyState, etc,
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
+	// 提示：这里需要做的事情包括：更新 peer 的存储状态，如raftState和applyState等，
+	// 并通过 ps.regionSched 将 RegionTaskApply 任务发送给 region worker，还请记住调用ps.clearMeta
+	// 和ps.clearExtraData删除过时数据
 	// Your Code Here (2C).
+
+	/* ApplySnapshot 描述：
+	 *	1. 负责应用 Snapshot，先通过 ps.clearMeta 和 ps.clearExtraData() 清除原来的数据，
+	 *     因为新的 snapshot 会包含新的 meta 信息，需要先清除老的。
+	 * 	2. 根据 Snapshot 的 Metadata 信息更新当前的 raftState 和 applyState。并保存信息到
+	 *     WriteBatch 中，可以等到 SaveReadyState() 方法结束时统一写入 DB。
+	 *	3. 发送 RegionTaskApply 到 regionSched 安装 snapshot，因为 Snapshot 很大，
+	 *     所以这里通过异步的方式安装。这里的实现是等待 Snapshot 安装完成后才继续执行，相当于没异步，以防出错。
+	 */
+
+	// 1. 删除过时数据：清空install snapshot之前的数据
+	if ps.isInitialized() {
+		ps.clearMeta(kvWB, raftWB)
+		ps.clearExtraData(snapData.Region)
+	}
+
+	// 2. 更新 peer_storage 的内存状态，包括：
+	// (1). RaftLocalState: 已经「持久化」到 DB 的最后一条日志设置为快照的最后一条日志
+	// (2). RaftApplyState: 「applied」和「truncated」日志设置为快照的最后一条日志
+	ps.raftState.LastIndex, ps.raftState.LastTerm = snapshot.Metadata.Index, snapshot.Metadata.Term
+	ps.applyState.AppliedIndex = snapshot.Metadata.Index
+	ps.applyState.TruncatedState.Index, ps.applyState.TruncatedState.Term = snapshot.Metadata.Index, snapshot.Metadata.Term
+	ps.snapState.StateType = snap.SnapState_Applying
+
+	// 将 applyState(状态机元数据信息)的修改加入 kvWB 中
+	if err := kvWB.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState); err != nil {
+		log.Panic(err)
+	}
+
+	// 3. 发送 runner.RegionTaskApply 任务给 region worker，并等待处理完毕
+	ch := make(chan bool, 1)
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: ps.region.Id,
+		Notifier: ch,
+		SnapMeta: snapshot.Metadata,
+		StartKey: snapData.Region.GetStartKey(),
+		EndKey:   snapData.Region.GetEndKey(),
+	}
+
+	// 阻塞等待 region worker 完成
+	if res := <-ch; res {
+		log.Infof("%v end to apply snapshot, metaDataIndex %v, truncatedStateIndex %v", ps.Tag, snapshot.Metadata.Index, ps.applyState.TruncatedState.Index)
+		result := &ApplySnapResult{PrevRegion: ps.region, Region: snapData.Region}
+
+		// snapshot 处理完了：修改 regionState 元数据（startkey、endkey之类的信息会修改）
+		meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal)
+
+		return result, nil
+	}
+
 	return nil, nil
 }
 
