@@ -93,6 +93,7 @@ type peer struct {
 	// Cache the peers information from other stores
 	// when sending raft messages to other peers, it's used to get the store id of target peer
 	// (Used in 3B conf change)
+	// 记录同 region 中其他 peer 节点的 storeId
 	peerCache map[uint64]*metapb.Peer
 	// Record the instants of peers being added into the configuration.
 	// Remove them after they are not pending any more.
@@ -351,7 +352,7 @@ func (p *peer) HeartbeatScheduler(ch chan<- worker.Task) {
 	}
 	ch <- &runner.SchedulerRegionHeartbeatTask{
 		Region:          clonedRegion,
-		Peer:            p.Meta,
+		Peer:            p.Meta, // 在newPeer中填写过了 splitPeerIds 了
 		PendingPeers:    p.CollectPendingPeers(),
 		ApproximateSize: p.ApproximateSize,
 	}

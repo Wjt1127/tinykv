@@ -83,7 +83,7 @@ type MockSchedulerClient struct {
 
 	baseID uint64
 
-	operators    map[uint64]*Operator
+	operators    map[uint64]*Operator    // peerId -> operation
 	leaders      map[uint64]*metapb.Peer // regionID -> peer
 	pendingPeers map[uint64]*metapb.Peer // peerID -> peer
 
@@ -283,15 +283,18 @@ func (m *MockSchedulerClient) RegionHeartbeat(req *schedulerpb.RegionHeartbeatRe
 		TargetPeer:  req.Leader,
 	}
 	if op := m.operators[regionID]; op != nil {
-		if m.tryFinished(op, req.Region, req.Leader) {
-			delete(m.operators, regionID)
+		if m.tryFinished(op, req.Region, req.Leader) { // 检查这个 op 是否已经完成
+			delete(m.operators, regionID) // 完成了就删掉这个 op
 		} else {
-			m.makeRegionHeartbeatResponse(op, resp)
+			m.makeRegionHeartbeatResponse(op, resp) // 来取出该操作，将其包装为 resp
 		}
 		log.Debugf("[region %d] schedule %v", regionID, op)
 	}
 
-	store := m.stores[req.Leader.GetStoreId()]
+	// 任何需要同步的操作都需要 leader 先处理，然后通过 appendEntries 进行同步
+	store := m.stores[req.Leader.GetStoreId()] // 获得 leader 的store
+	// onRegionHeartbeatResponse：最终是通过 sendAdminRequest 将 Add、Remove 封装为 AdminRequest，
+	// 之后会被进一步封装为 RaftCmdRequest，然后就是通过 proposeRaftCommand 将指令下发给 Leader
 	store.heartbeatResponseHandler(resp)
 	return nil
 }

@@ -140,7 +140,7 @@ func (rn *RawNode) ProposeConfChange(cc pb.ConfChange) error {
 }
 
 // ApplyConfChange applies a config change to the local node.
-// 根据proposeConfigChangeMsg 修改集群节点配置，根据 ConfChangeType 是增加或减少节点，然后修改 ConfState 信息
+// 根据 proposeConfigChangeMsg 修改集群节点配置，根据 ConfChangeType 是增加或减少节点，然后修改 ConfState 信息
 func (rn *RawNode) ApplyConfChange(cc pb.ConfChange) *pb.ConfState {
 	if cc.NodeId == None {
 		return &pb.ConfState{Nodes: nodes(rn.Raft)}

@@ -131,7 +131,7 @@ func (d *peerMsgHandler) processCommittedEntry(entry *pb.Entry, kvWB *engine_uti
 		if err := confChange.Unmarshal(entry.Data); err != nil {
 			log.Panic(err)
 		}
-		log.Infof("EntryType_EntryConfChange")
+		// log.Infof("EntryType_EntryConfChange")
 		return d.processConfChange(entry, confChange, kvWB)
 	}
 
@@ -139,6 +139,18 @@ func (d *peerMsgHandler) processCommittedEntry(entry *pb.Entry, kvWB *engine_uti
 	requests := &raft_cmdpb.RaftCmdRequest{}
 	if err := requests.Unmarshal(entry.Data); err != nil { // 解析 entry.Data 中的数据
 		log.Panic(err)
+	}
+
+	// 判断 RegionEpoch
+	if requests.Header != nil {
+		fromEpoch := requests.GetHeader().GetRegionEpoch()
+		if fromEpoch != nil {
+			if util.IsEpochStale(fromEpoch, d.Region().RegionEpoch) {
+				resp := ErrResp(&util.ErrEpochNotMatch{})
+				d.callbackAfterProcessCmds(entry, resp, false)
+				return kvWB
+			}
+		}
 	}
 
 	// 判断是普通 request 还是 AdminRequest
@@ -277,14 +289,223 @@ func (d *peerMsgHandler) processAdminRequest(entry *pb.Entry, requests *raft_cmd
 			d.ScheduleCompactLog(adminReq.CompactLog.CompactIndex)
 			// log.Infof("%d apply commit, entry %v, type %s, truncatedIndex %v", d.peer.PeerId(), entry.Index, adminReq.CmdType, adminReq.CompactLog.CompactIndex)
 		}
+
+	case raft_cmdpb.AdminCmdType_Split:
+		// 检查是否是分裂这个 region
+		if requests.Header.RegionId != d.regionId {
+			regionNotFound := &util.ErrRegionNotFound{RegionId: requests.Header.RegionId}
+			d.callbackAfterProcessCmds(entry, ErrResp(regionNotFound), false)
+			return kvWB
+		}
+
+		// 检查是否是过期的 split 请求
+		if errEpochNotMatch, ok := util.CheckRegionEpoch(requests, d.Region(), true).(*util.ErrEpochNotMatch); ok {
+			d.callbackAfterProcessCmds(entry, ErrResp(errEpochNotMatch), false)
+			return kvWB
+		}
+
+		// error: key 不在 originalRegion 中
+		if err := util.CheckKeyInRegion(adminReq.Split.SplitKey, d.Region()); err != nil {
+			d.callbackAfterProcessCmds(entry, ErrResp(err), false)
+			return kvWB
+		}
+
+		// 检查 New Split Region 的 peers 和当前 originalRegion 的 peers 数量是否相等
+		if len(d.Region().Peers) != len(adminReq.Split.NewPeerIds) {
+			resp := ErrResp(errors.Errorf("length of NewPeerIds != length of Peers"))
+			d.callbackAfterProcessCmds(entry, resp, false)
+			return kvWB
+		}
+
+		originalRegion := d.Region()
+		splitCtx := adminReq.Split
+
+		// 从 splitReq 中获取 peerId 并分配 newRegion 的newPeers
+		newPeers := make([]*metapb.Peer, 0)
+		for i, peer := range d.Region().Peers {
+			newPeers = append(newPeers, &metapb.Peer{
+				Id:      splitCtx.NewPeerIds[i],
+				StoreId: peer.StoreId,
+			})
+		}
+
+		// 使用 newPeer 创建 newRegion
+		newRegion := &metapb.Region{
+			Id:       splitCtx.NewRegionId,
+			StartKey: splitCtx.SplitKey,
+			EndKey:   d.Region().EndKey,
+			RegionEpoch: &metapb.RegionEpoch{
+				ConfVer: InitEpochConfVer,
+				Version: InitEpochVer,
+			},
+			Peers: newPeers,
+		}
+
+		// TinyKv 使用range作为 kv region 的划分，这样做split的时候不需要数据搬运，只需要元数据修改即可
+		// 修改 storaMeta 信息
+		storeMeta := d.ctx.storeMeta
+		storeMeta.Lock()
+		originalRegion.RegionEpoch.Version++
+		// 这个 regionRange 是一个 btree 结构 ： key 映射-> region
+		originalRegion.EndKey = splitCtx.SplitKey
+		storeMeta.regions[newRegion.Id] = newRegion
+		storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: originalRegion}) // 添加修改后的originalRegion数据映射范围
+		storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: newRegion})      // 添加newRegion数据映射范围
+		// 持久化 oldRegion 和 newRegion
+		meta.WriteRegionState(kvWB, originalRegion, rspb.PeerState_Normal)
+		meta.WriteRegionState(kvWB, newRegion, rspb.PeerState_Normal)
+		storeMeta.Unlock()
+
+		// 创建当前 store 上的 newRegion Peer，注册到 router，并启动
+		// createPeer 是因为 newRegion 在上面只是创建了结构体元数据，具体的实例对象没有创建，peer底层的rawNode等实例
+		// 注册到 router 是因为当在网络中 send Msg 的时候，需要根据 peerId 来进行网络转发
+		newPeer, err := createPeer(d.storeID(), d.ctx.cfg, d.ctx.schedulerTaskSender, d.ctx.engine, newRegion)
+		if err != nil {
+			log.Panic(err)
+		}
+		newPeer.peerStorage.SetRegion(newRegion)
+		d.ctx.router.register(newPeer)
+		// 发送 MsgTypeStart 启动 peer，因为这个时候只注册了本届点的 peer ，所以只会发送到本peer
+		// 实则就是启动本 peer，newRegion 中的其他 peer 需要通过后面的 HeartbeatScheduler 发送
+		err = d.ctx.router.send(newRegion.Id, message.Msg{Type: message.MsgTypeStart, RegionID: newRegion.Id})
+		if err != nil {
+			log.Panic(err)
+		}
+
+		// 处理回调函数
+		d.callbackAfterProcessCmds(entry, &raft_cmdpb.RaftCmdResponse{
+			Header: &raft_cmdpb.RaftResponseHeader{},
+			AdminResponse: &raft_cmdpb.AdminResponse{
+				CmdType: raft_cmdpb.AdminCmdType_Split,
+				Split:   &raft_cmdpb.SplitResponse{Regions: []*metapb.Region{newRegion, originalRegion}},
+			},
+		}, false)
+		log.Infof("[AdminCmdType_Split Process] originalRegin %v, newRegion %v", originalRegion, newRegion)
+
+		// 发送 heartbeat 给其他节点, 通过 Scheduler 层的 heartBeat 来创建并启动新的 peer
+		if d.IsLeader() {
+			d.newRegionHeartbeatScheduler(originalRegion, d.peer) // 启动 originalRegion 的peers
+			d.newRegionHeartbeatScheduler(newRegion, newPeer)     // 启动 newRegion 的peers
+		}
 	}
 	return kvWB
 }
 
+// notifyHeartbeatScheduler 帮助 region 快速创建 peer
+func (d *peerMsgHandler) newRegionHeartbeatScheduler(region *metapb.Region, peer *peer) {
+	clonedRegion := new(metapb.Region)
+	err := util.CloneMsg(region, clonedRegion)
+	if err != nil {
+		return
+	}
+	d.ctx.schedulerTaskSender <- &runner.SchedulerRegionHeartbeatTask{
+		Region:          clonedRegion,
+		Peer:            peer.Meta,
+		PendingPeers:    peer.CollectPendingPeers(),
+		ApproximateSize: peer.ApproximateSize,
+	}
+}
+
 // HandleRaftReady 中处理 Ready 中需要持久化的 Entry 条目，这个 Entry 条目是 confChangeType 类型的
 func (d *peerMsgHandler) processConfChange(entry *pb.Entry, confChange *pb.ConfChange, kvWB *engine_util.WriteBatch) *engine_util.WriteBatch {
+	msg := &raft_cmdpb.RaftCmdRequest{}
+	if err := msg.Unmarshal(confChange.Context); err != nil {
+		log.Panic(err)
+	}
+
+	// 检查 Command Request 中的 RegionEpoch 是否是过期的，以此判定是不是一个重复的请求
+	// 测试程序可能会多次提交同一个 ConfChange 直到 ConfChange 被应用
+	// 判断 RegionEpoch
+	if msg.Header != nil {
+		fromEpoch := msg.GetHeader().GetRegionEpoch()
+		if fromEpoch != nil {
+			if util.IsEpochStale(fromEpoch, d.Region().RegionEpoch) {
+				resp := ErrResp(&util.ErrEpochNotMatch{})
+				d.callbackAfterProcessCmds(entry, resp, false)
+				return kvWB
+			}
+		}
+	}
+
+	switch confChange.ChangeType {
+	case pb.ConfChangeType_AddNode:
+		log.Infof("[AddNode] %v add %v", d.PeerId(), confChange.NodeId)
+		// 待添加的节点必须原先在 Region 中不存在
+		if d.searchPeerWithId(confChange.NodeId) == len(d.Region().Peers) {
+			// 将新增的 Node peer 加入 region 中
+			d.Region().Peers = append(d.Region().Peers, msg.AdminRequest.ChangePeer.Peer)
+			d.Region().RegionEpoch.ConfVer++
+			meta.WriteRegionState(kvWB, d.Region(), rspb.PeerState_Normal) // PeerState_Normal 表示该节点在region中正常运作
+
+			// 通过 d.ctx 中的 storeMeta 修改该 store 的元数据信息
+			storeMeta := d.ctx.storeMeta
+			storeMeta.Lock()
+			storeMeta.regions[d.Region().Id] = d.Region()
+			storeMeta.Unlock()
+
+			// 更新 peerCache，peerCache 保存了 peerId -> Peer 的映射
+			// 当前 raft_store 上的 peer 需要发送消息给同一个 region 中的别的节点的时候，需要获取别的节点所在 storeId
+			// peerCache 里面就保存了属于同一个 region 的所有 peer 的元信息（peerId, storeId）
+			d.insertPeerCache(msg.AdminRequest.ChangePeer.Peer)
+		}
+
+	case pb.ConfChangeType_RemoveNode:
+		// 删除的是本 peerNode，那么会在本 peerMsgHandler 中彻底删除相应的数据信息，并且标识为 Tombstone
+		// 如果删除的是其他节点，那么本节点上对他的处理就是删除相关的元数据信息和cache
+		log.Infof("[RemoveNode] %v remove %v", d.PeerId(), confChange.NodeId)
+
+		// 如果目标节点是自身，那么直接销毁并返回：从 raft_store 上删除所属 region 的所有信息
+		if d.PeerId() == msg.AdminRequest.ChangePeer.Peer.Id {
+			d.destroyPeer() // 在里面使用 WriteRegionState 将这个 peer 设置成了 PeerState_Tombstone
+			return kvWB
+		}
+
+		// 判断要删除的节点是否在 region 内
+		idxOfRegionPeers := d.searchPeerWithId(msg.AdminRequest.ChangePeer.Peer.Id)
+		if idxOfRegionPeers != len(d.Region().Peers) {
+			// 删除节点 d.Region().Peers 中的第 n 个 peer
+			d.Region().Peers = append(d.Region().Peers[:idxOfRegionPeers], d.Region().Peers[idxOfRegionPeers+1:]...)
+			d.Region().RegionEpoch.ConfVer++
+			meta.WriteRegionState(kvWB, d.Region(), rspb.PeerState_Normal) // PeerState 用来表示当前 Peer 是否在 region 中，这里是为了把 confver 版本号的修改写入
+
+			// 更新 metaStore 中的 region 信息
+			storeMeta := d.ctx.storeMeta
+			storeMeta.Lock()
+			storeMeta.regions[d.Region().Id] = d.Region()
+			storeMeta.Unlock()
+			// 更新 peerCache
+			d.removePeerCache(confChange.NodeId)
+		}
+	}
+
+	// 更新 raft 层的配置信息
+	d.RaftGroup.ApplyConfChange(*confChange)
+	// 处理 proposal
+	d.callbackAfterProcessCmds(entry, &raft_cmdpb.RaftCmdResponse{
+		Header: &raft_cmdpb.RaftResponseHeader{},
+		AdminResponse: &raft_cmdpb.AdminResponse{
+			CmdType:    raft_cmdpb.AdminCmdType_ChangePeer,
+			ChangePeer: &raft_cmdpb.ChangePeerResponse{Region: d.Region()},
+		},
+	}, false)
+
+	// Add 的 peer 通过 HeartbeatScheduler 启动
+	if d.IsLeader() {
+		d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+	}
 
 	return kvWB
+}
+
+// 判断 nodeId 所表示的 peer 是否在 region 内，并返回他在 region().peers 中的下标
+func (d *peerMsgHandler) searchPeerWithId(nodeId uint64) int {
+	for idx, peer := range d.Region().Peers {
+		if peer.Id == nodeId {
+			return idx
+		}
+	}
+
+	return len(d.Region().Peers)
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -295,7 +516,7 @@ func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
 		if err := d.onRaftMsg(raftMsg); err != nil {
 			log.Errorf("%s handle raft message error %v", d.Tag, err)
 		}
-	case message.MsgTypeRaftCmd: // 上层应用的 kv 指令：可能是NormalCmd（put、get、snapshot、delete）或 AdminCmd
+	case message.MsgTypeRaftCmd: // 上层应用的 kv 指令：可能是NormalCmd（put、get、snapshot、delete）或 AdminCmd(compactLog/AddNode/RemoveNode/SplitRegion)
 		raftCMD := msg.Data.(*message.MsgRaftCmd)
 		d.proposeRaftCommand(raftCMD.Request, raftCMD.Callback)
 	case message.MsgTypeTick:
@@ -371,7 +592,9 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 // propose 上层应用或根据配置信息触发的 AdminRequest
 func (d *peerMsgHandler) proposeAdminRequest(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
 	switch msg.AdminRequest.CmdType {
-	case raft_cmdpb.AdminCmdType_CompactLog: // 日志压缩需要提交到 raft 同步
+
+	// 日志压缩需要提交到 raft 同步
+	case raft_cmdpb.AdminCmdType_CompactLog:
 		data, err := msg.Marshal()
 		if err != nil {
 			log.Panic(err)
@@ -379,6 +602,79 @@ func (d *peerMsgHandler) proposeAdminRequest(msg *raft_cmdpb.RaftCmdRequest, cb 
 		if err := d.RaftGroup.Propose(data); err != nil {
 			log.Panic(err)
 		}
+
+	// LeaderTransfer 请求
+	case raft_cmdpb.AdminCmdType_TransferLeader:
+		// 领导权禅让 Leader step 直接执行即可
+		d.RaftGroup.TransferLeader(msg.AdminRequest.TransferLeader.Peer.Id)
+		// 返回 response
+		adminResp := &raft_cmdpb.AdminResponse{
+			CmdType:        raft_cmdpb.AdminCmdType_TransferLeader,
+			TransferLeader: &raft_cmdpb.TransferLeaderResponse{},
+		}
+		cb.Done(&raft_cmdpb.RaftCmdResponse{
+			Header:        &raft_cmdpb.RaftResponseHeader{},
+			AdminResponse: adminResp,
+		})
+
+	// AddNode 或者 RemoveNode：集群成员变更，需要提交到 raft，并处理 proposal 回调
+	case raft_cmdpb.AdminCmdType_ChangePeer:
+		// 单步成员变更：上一次的成员变更被提交之后才可以执行下一步成员变更
+		// 通过 appliedIndex 和 raft.PendingConfIndex 来判断上一次的 confChange 是否被应用
+
+		// 上一条 confChange 被应用了
+		if d.peerStorage.AppliedIndex() >= d.RaftGroup.Raft.PendingConfIndex {
+			// 如果 region 只有两个节点，并且需要 remove leader，则需要先完成 transferLeader
+			// 否则，剩下的那个节点在超时后无法通过 requestVote 成为 leader
+			if len(d.Region().Peers) == 2 && msg.AdminRequest.ChangePeer.ChangeType == pb.ConfChangeType_RemoveNode && msg.AdminRequest.ChangePeer.Peer.Id == d.PeerId() {
+				for _, peer := range d.Region().Peers {
+					if peer.Id != d.PeerId() {
+						d.RaftGroup.TransferLeader(peer.Id)
+						break
+					}
+				}
+			}
+
+			// 1. 创建 proposal, 完成 confChange apply 之后通过 proposal 中的 callback 通知client
+			d.proposals = append(d.proposals, &proposal{
+				index: d.nextProposalIndex(),
+				term:  d.Term(),
+				cb:    cb,
+			})
+
+			// 2. 提交到 raft 层
+			context, _ := msg.Marshal()
+			cc := pb.ConfChange{
+				ChangeType: msg.AdminRequest.ChangePeer.ChangeType, // 变更类型
+				NodeId:     msg.AdminRequest.ChangePeer.Peer.Id,    // 变更成员 id
+				Context:    context,
+			}
+			d.RaftGroup.ProposeConfChange(cc)
+		}
+
+	case raft_cmdpb.AdminCmdType_Split: // 消息中包含了splitKey，这个是在发出请求的时候由splitChecker分配新的regionId和peerId，同时根据 splitSize 划分出了 splitKey
+		// 如果收到的 Region Split 请求是一条过期的请求，则不应该提交到 Raft,因为目标 region 可能已经产生了分裂
+		if err := util.CheckRegionEpoch(msg, d.Region(), true); err != nil {
+			log.Infof("[AdminCmdType_Split] Region %v Split, a expired request", d.Region())
+			cb.Done(ErrResp(err))
+			return
+		}
+
+		// 检查 splitKey 是否在本 region 中
+		if err := util.CheckKeyInRegion(msg.AdminRequest.Split.SplitKey, d.Region()); err != nil {
+			cb.Done(ErrResp(err))
+			return
+		}
+		log.Infof("[AdminCmdType_Split Propose] Region %v Split, entryIndex %v", d.Region(), d.nextProposalIndex())
+
+		// 将 splitRegion 请求提交到 Raft 层
+		d.proposals = append(d.proposals, &proposal{
+			index: d.nextProposalIndex(),
+			term:  d.Term(),
+			cb:    cb,
+		})
+		data, _ := msg.Marshal()
+		d.RaftGroup.Propose(data)
 	}
 }
 

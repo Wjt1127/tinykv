@@ -171,6 +171,9 @@ type Raft struct {
 	// be proposed if the leader's applied index is greater than this
 	// value.
 	// (Used in 3A conf change)
+	// PendingConfIndex 表示当前还没有生效的 ConfChange，只有在日志被提交并应用之后才会生效
+	// 一次只能挂起一个conf更改（在日志中，但尚未应用）。这是通过PendingConfIndex实现的，
+	// 该值设置为>=最新挂起配置更改（如果有）的日志索引。仅当领导者的应用索引大于此值时，才允许提议配置更改。
 	PendingConfIndex uint64 // 记录配置文件修改的 entry index
 
 	// 增加一个随机 electionTimeOut
@@ -257,7 +260,7 @@ func (r *Raft) leaderTick() {
 	// 3A：transferee 失败
 	if r.leadTransferee != None {
 		// leader 转移失败，目标节点可能挂了，放弃转移，恢复客户端的请求propose回应
-		if r.transfereeElapsed >= 2*uint64(r.electionTimeout) {
+		if r.transfereeElapsed >= uint64(r.electionTimeout) {
 			r.leadTransferee = None
 		}
 	}
@@ -298,7 +301,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.Lead = lead
 	r.State = StateFollower
 	r.electionElapsed = 0
-	r.leadTransferee = None
+	r.leadTransferee = None // 除了超时，只有leader完成身份转变，leadTransferee 消息才成功
 	r.setRandomElectionTime()
 }
 
@@ -311,6 +314,7 @@ func (r *Raft) becomeCandidate() {
 	r.Vote = r.id
 	r.votes[r.id] = true
 
+	r.leadTransferee = None
 	r.setRandomElectionTime()
 }
 
@@ -539,7 +543,7 @@ func (r *Raft) handlePropose(m pb.Message) {
 	r.RaftLog.appendEntries(m.Entries)
 
 	// 3A：当 leader 正在进行转换操作时，所有的 propose 请求均被拒绝
-	// 在这里 leader 还是先持久化这条 message 但是不会同步其他节点
+	// 在这里 leader 还是先持久化这条 message 但是不会同步其他节点，因为后续可能 transferee 失效，继续完成日志同步
 	if r.leadTransferee != None {
 		return
 	}
