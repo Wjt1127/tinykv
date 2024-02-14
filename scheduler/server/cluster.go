@@ -277,8 +277,48 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 }
 
 // processRegionHeartbeat updates the region information.
+// 每个 region 都会周期性的发送心跳给调度器，调度器会检查收到心跳
+// 中的region 信息是否合适，以此更新自己的记录的 regions 信息
+// 通过使用 conf_ver 和版本来确定是否需要更新，即 RegionEpoch
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 	// Your Code Here (3C).
+	epochOfRegionHeartBeat := region.GetRegionEpoch()
+	if epochOfRegionHeartBeat == nil {
+		return errors.Errorf("region has no epoch")
+	}
+
+	// 检查当前的scheduler的元数据信息中是否有这个 regionId
+	oldRegion := c.GetRegion(region.GetID())
+	if oldRegion != nil {
+		oldEpoch := oldRegion.GetRegionEpoch()
+
+		// 检查是否有RegionHeartBeat 的 Epoch 是否更新, 主要有两个原因：
+		// 1. 当这个 region 没有变化时，说明scheduler中存储的 region 信息不需要update
+		// 2. Scheduler 不能相信每一次心跳。特别是说，如果集群在某个部分有分区，一些节点的信息可能是错误的。
+		//    例如，一些 Region 在被分割后会重新启动选举和分割，但另一批孤立的节点仍然通过心跳向 Scheduler
+		//    发送过时的信息。所以对于一个 Region 来说，两个节点中的任何一个都可能说自己是领导者，这意味着
+		//    Scheduler 不能同时信任它们。
+		if epochOfRegionHeartBeat.ConfVer < oldEpoch.ConfVer || epochOfRegionHeartBeat.Version < oldEpoch.Version {
+			return errors.Errorf("region is stale")
+		}
+	} else { // 如果没有相同的 regionId，那么判断一下是否有[startkey, endKey)重叠数据的 region
+		// 并且比较这个heartBeatRegion 和重叠数据的region的 epoch 版本
+		// 扫描所有重叠的 region
+		keyOverlapRegions := c.ScanRegions(region.GetStartKey(), region.GetEndKey(), -1)
+		for _, r := range keyOverlapRegions {
+			rEpoch := r.GetRegionEpoch()
+			if epochOfRegionHeartBeat.ConfVer < rEpoch.ConfVer || epochOfRegionHeartBeat.Version < rEpoch.Version {
+				return errors.Errorf("region is stale")
+			}
+		}
+	}
+
+	// region 的 confVer（transferee/addnode/removenode） 或者 Version(split) 有改变
+	// 说明 region 是最新的，更新 region tree 和 store status
+	c.putRegion(region) // remove 原来的再 add 这个
+	for i := range region.GetStoreIds() {
+		c.updateStoreStatusLocked(i)
+	}
 
 	return nil
 }
