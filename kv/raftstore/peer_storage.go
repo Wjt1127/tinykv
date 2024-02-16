@@ -392,7 +392,7 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		EndKey:   snapData.Region.GetEndKey(),
 	}
 
-	// 阻塞等待 region worker 完成
+	// 阻塞等待 region worker 完成 snapshot 的 apply
 	if res := <-ch; res {
 		log.Infof("%v end to apply snapshot, metaDataIndex %v, truncatedStateIndex %v", ps.Tag, snapshot.Metadata.Index, ps.applyState.TruncatedState.Index)
 		result := &ApplySnapResult{PrevRegion: ps.region, Region: snapData.Region}

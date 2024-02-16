@@ -1010,7 +1010,7 @@ func (r *Raft) addNode(id uint64) {
 	}
 }
 
-// removeNode remove a node from raft group
+// removeNode remove a node from raft group(并不是把cluster中的这个store删掉，而是删除某个region的peer)
 // 需要额外计算 commitedIndex
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
