@@ -51,7 +51,7 @@ func (scan *Scanner) Next() ([]byte, []byte, error) {
 	userKey := DecodeUserKey(gotKey)
 
 	// 假阳性冲突
-	if !bytes.Equal(gotKey, key) {
+	if !bytes.Equal(userKey, key) {
 		scan.nextKey = userKey
 		return scan.Next()
 	}
@@ -72,7 +72,7 @@ func (scan *Scanner) Next() ([]byte, []byte, error) {
 		}
 	}
 
-	writeVal, err := nextItem.ValueCopy(nil)
+	writeVal, err := item.ValueCopy(nil)
 	if err != nil {
 		return key, nil, err
 	}
